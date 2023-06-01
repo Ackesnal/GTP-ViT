@@ -4,7 +4,7 @@
 
 ## Environment installation
 
-Install Python 3.8+, PyTorch 1.7.0+, torchvision 0.8.1+ and timm==0.4.12:
+Install Python 3.8+, PyTorch and timm:
 
 ```
 conda create -n gtp python=3.8
