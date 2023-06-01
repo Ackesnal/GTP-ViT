@@ -7,7 +7,7 @@
 Install Python 3.8+, PyTorch and timm:
 
 ```
-conda create -n gtp python=3.8
+conda create -n gtp python=3.8.13
 conda activate gtp
 conda install pytorch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 pytorch-cuda=11.8 -c pytorch -c nvidia
 pip install timm==0.9.2
