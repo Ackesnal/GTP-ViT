@@ -10,6 +10,7 @@ from timm.models.layers import trunc_normal_, PatchEmbed, Mlp, DropPath
 import math
 from typing import Optional
 import timm
+import torch.utils.checkpoint as cp
 import tome
 
 
@@ -528,7 +529,10 @@ class GraphPropagationTransformer(VisionTransformer):
             token_scales = None
         
         for blk in self.blocks:
-            x, graph, token_scales = blk(x, graph, token_scales, self.class_token)
+            if self.training:
+                x, graph, token_scales = cp.checkpoint(blk, x, graph, token_scales, self.class_token)
+            else:
+                x, graph, token_scales = blk(x, graph, token_scales, self.class_token)
         
         x = self.norm(x)
         return x
