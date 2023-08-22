@@ -11,33 +11,39 @@ import json
 from pathlib import Path
 
 from timm.data import Mixup
-from timm.models import create_model
+from timm.models import create_model#, vision_transformer
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.scheduler import create_scheduler
 from timm.optim import create_optimizer
 from timm.utils import NativeScaler, get_state_dict, ModelEma
+from timm.models.vision_transformer import _load_weights
+import timm
 
 from datasets import build_dataset
 from engine import train_one_epoch, evaluate
 from losses import DistillationLoss
 from samplers import RASampler
 from augment import new_data_aug_generator
+import safetensors
+
+import numpy as np
 
 import models
 import models_v2
 import models_v3
+import lvvit
 import utils
 from torchprofile import profile_macs
 
-def get_macs(model, x=None):
+def get_macs(model, x=None, img_size=224):
     model.eval()
     if x is None:
-        x = torch.rand(1, 3, 224, 224).cuda()
+        x = torch.rand(1, 3, img_size, img_size).cuda()
     macs = profile_macs(model, x)
     return macs
 
 
-def speed_test(model, ntest=100, batchsize=128, x=None, **kwargs):
+def speed_test(model, ntest=100, batchsize=32, x=None, **kwargs):
     if x is None:
         x = torch.rand(batchsize, 3, 224, 224).cuda()
     else:
@@ -49,9 +55,6 @@ def speed_test(model, ntest=100, batchsize=128, x=None, **kwargs):
         with torch.no_grad():
             for i in range(ntest):
                 model(x, **kwargs)
-    for i in range(ntest):
-        model(x, **kwargs)
-    torch.cuda.synchronize()
     end = time.time()
 
     elapse = end - start
@@ -199,7 +202,7 @@ def get_args_parser():
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
-    parser.add_argument('--eval-crop-ratio', default=0.875, type=float, help="Crop ratio for evaluation")
+    parser.add_argument('--eval-crop-ratio', default=0.9, type=float, help="Crop ratio for evaluation")
     parser.add_argument('--dist-eval', action='store_true', default=False, help='Enabling distributed evaluation')
     parser.add_argument('--num_workers', default=10, type=int)
     parser.add_argument('--pin-mem', action='store_true',
@@ -217,7 +220,7 @@ def get_args_parser():
     parser.add_argument('--selection', default='None', 
                         choices=['CLSAttnMean', 'CLSAttnMax', 'IMGAttnMean', 'IMGAttnMax', 
                                  'DiagAttnMean', 'DiagAttnMax', 'MixedAttnMean', 'MixedAttnMax',
-                                 'CosSimMean', 'CosSimMax', 'Random', 'None'],
+                                 'CosSimMean', 'CosSimMax', 'SumAttnMax','Random', 'None'],
                         type=str)
     # Methods of propagating tokens
     parser.add_argument('--propagation', default='None',
@@ -312,7 +315,7 @@ def main(args):
     print(f"Creating model: {args.model}")
     model = create_model(
         args.model,
-        pretrained=False,
+        pretrained=True,
         num_classes=args.nb_classes,
         drop_rate=args.drop,
         drop_path_rate=args.drop_path,
@@ -387,27 +390,6 @@ def main(args):
             print('no patch embed')
             
     model.to(device)
-    
-    if args.test_speed:
-        # test model throughput for three times to ensure accuracy
-        print('Start inference speed testing...')
-        inference_speed = speed_test(model)
-        print('inference_speed (inaccurate):', inference_speed, 'images/s')
-        total = 0
-        inference_speed = speed_test(model)
-        print('inference_speed:', inference_speed, 'images/s')
-        total = total + inference_speed
-        inference_speed = speed_test(model)
-        print('inference_speed:', inference_speed, 'images/s')
-        total = total + inference_speed
-        inference_speed = speed_test(model)
-        print('inference_speed:', inference_speed, 'images/s')
-        total = total + inference_speed
-        print('Average throughput:', round(total/3, 2), 'images/s')
-        MACs = get_macs(model)
-        print('GMACs:', MACs * 1e-9)
-    if args.only_test_speed:
-        return
 
     model_ema = None
     if args.model_ema:
@@ -472,26 +454,85 @@ def main(args):
 
     output_dir = Path(args.output_dir)
     if args.resume:
-        if args.resume.startswith('https'):
-            checkpoint = torch.hub.load_state_dict_from_url(
-                args.resume, map_location='cpu', check_hash=True)
+        if args.resume.endswith(".npz"):
+            _load_weights(model_without_ddp, args.resume)
         else:
-            checkpoint = torch.load(args.resume, map_location='cpu')
-        model_without_ddp.load_state_dict(checkpoint['model'])
-        if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-            args.start_epoch = checkpoint['epoch'] + 1
-            if args.model_ema:
-                utils._load_checkpoint_for_ema(model_ema, checkpoint['model_ema'])
-            if 'scaler' in checkpoint:
-                loss_scaler.load_state_dict(checkpoint['scaler'])
-        lr_scheduler.step(args.start_epoch)
+            if args.resume.startswith('https'):
+                checkpoint = torch.hub.load_state_dict_from_url(
+                    args.resume, map_location='cpu', check_hash=True)
+            elif args.resume.endswith(".safetensors"):
+                checkpoint = safetensors.torch.load_file(args.resume, device="cpu")
+            else:
+                checkpoint = torch.load(args.resume, map_location='cpu')
+            
+            if 'student' in checkpoint:
+                new_checkpoint = dict()
+                for key, value in checkpoint["student"].items():
+                    key = key.replace("module.", "")
+                    if key == "head.last_layer.weight":
+                        new_checkpoint[key+"_v"] = value
+                    else:
+                        new_checkpoint[key] = value
+                checkpoint = new_checkpoint
+            
+            try:
+                model_without_ddp.load_state_dict(checkpoint['model'])
+            except:
+                model_without_ddp.load_state_dict(checkpoint)
+            if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+                args.start_epoch = checkpoint['epoch'] + 1
+                if args.model_ema:
+                    utils._load_checkpoint_for_ema(model_ema, checkpoint['model_ema'])
+                if 'scaler' in checkpoint:
+                    loss_scaler.load_state_dict(checkpoint['scaler'])
+            lr_scheduler.step(args.start_epoch)
+    
+    
+    if args.test_speed:
+        # test model throughput for three times to ensure accuracy
+        print('Start inference speed testing...')
+        inference_speed = speed_test(model)
+        print('inference_speed (inaccurate):', inference_speed, 'images/s')
+        total = 0
+        inference_speed = speed_test(model)
+        print('inference_speed:', inference_speed, 'images/s')
+        total = total + inference_speed
+        inference_speed = speed_test(model)
+        print('inference_speed:', inference_speed, 'images/s')
+        total = total + inference_speed
+        #inference_speed = speed_test(model)
+        #print('inference_speed:', inference_speed, 'images/s')
+        #total = total + inference_speed
+        print('Average throughput:', round(total/2, 2), 'images/s')
+        MACs = get_macs(model_without_ddp,  None, args.input_size)
+        print('GMACs:', MACs * 1e-9)
+    if args.only_test_speed:
+        return
+        
+            
     if args.eval:
-        MACs = get_macs(model)
+        MACs = get_macs(model_without_ddp, None, args.input_size)
         print('GMACs:', MACs * 1e-9)
         test_stats = evaluate(data_loader_val, model, device)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+        
+        """
+        ####### delete
+        with open(args.model+"_results", "a") as fp:
+            fp.write("|  Num Prop: %2d  " % args.num_prop)
+            fp.write("|  GMACs: %1.3f  " % (MACs*1e-9))
+            fp.write("|  Top-1 Acc: %2.2f  " % test_stats['acc1'])
+            fp.write("|  Selection: %13s  " % args.selection)
+            fp.write("|  Propagation: %10s  " % args.propagation)
+            fp.write("|  Sparsity: %1.2f  " % args.sparsity)
+            fp.write("|  Alpha: %1.2f  " % args.alpha)
+            fp.write("|  Scale: %5s  " % str(args.token_scale))
+            fp.write("|  Graph: %8s  |\n\n" % str(args.graph_type))
+        ####### delete
+        """
+        
         return
     
     MACs = get_macs(model)

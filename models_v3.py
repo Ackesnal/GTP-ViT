@@ -4,18 +4,20 @@ import torch
 import torch.nn as nn
 from functools import partial
 
-from timm.models.vision_transformer import VisionTransformer, _cfg
+from timm.models.vision_transformer import VisionTransformer, _cfg, _load_weights
 from timm.models._registry import register_model
 from timm.models.layers import trunc_normal_, PatchEmbed, Mlp, DropPath
 import math
 from typing import Optional
 import timm
+import tome
 
 
 def propagate(x: torch.Tensor, weight: torch.Tensor, 
               index_kept: torch.Tensor, index_prop: torch.Tensor, 
               standard: str = "None", alpha: Optional[float] = 0, 
-              token_scales: Optional[torch.Tensor] = None):
+              token_scales: Optional[torch.Tensor] = None,
+              cls_token=True):
     """
     Propagate tokens based on the selection results.
     ================================================
@@ -51,13 +53,15 @@ def propagate(x: torch.Tensor, weight: torch.Tensor,
     B, N, C = x.shape
     
     # Step 1: divide tokens
-    x_cls = x[:, 0:1] # B, 1, C
+    if cls_token:
+        x_cls = x[:, 0:1] # B, 1, C
     x_kept = x.gather(dim=1, index=index_kept.unsqueeze(-1).expand(-1,-1,C)) # B, N-1-num_prop, C
     x_prop = x.gather(dim=1, index=index_prop.unsqueeze(-1).expand(-1,-1,C)) # B, num_prop, C
     
     # Step 2: divide token_scales if it is not None
     if token_scales is not None:
-        token_scales_cls = token_scales[:, 0:1] # B, 1
+        if cls_token:
+            token_scales_cls = token_scales[:, 0:1] # B, 1
         token_scales_kept = token_scales.gather(dim=1, index=index_kept) # B, N-1-num_prop
         token_scales_prop = token_scales.gather(dim=1, index=index_prop) # B, num_prop
     
@@ -86,12 +90,16 @@ def propagate(x: torch.Tensor, weight: torch.Tensor,
         assert weight is not None, "The graph weight is needed for graph propagation"
         
         # Step 3.1: divide propagation weights.
-        index_kept = index_kept - 1 # since weights do not include the [CLS] token
-        index_prop = index_prop - 1 # since weights do not include the [CLS] token
-        
-        weight = weight.gather(dim=1, index=index_kept.unsqueeze(-1).expand(-1,-1,N-1)) # B, N-1-num_prop, N-1
-        weight_prop = weight.gather(dim=2, index=index_prop.unsqueeze(1).expand(-1,weight.shape[1],-1)) # B, N-1-num_prop, num_prop
-        weight = weight.gather(dim=2, index=index_kept.unsqueeze(1).expand(-1,weight.shape[1],-1)) # B, N-1-num_prop, N-1-num_prop
+        if cls_token:
+            index_kept = index_kept - 1 # since weights do not include the [CLS] token
+            index_prop = index_prop - 1 # since weights do not include the [CLS] token
+            weight = weight.gather(dim=1, index=index_kept.unsqueeze(-1).expand(-1,-1,N-1)) # B, N-1-num_prop, N-1
+            weight_prop = weight.gather(dim=2, index=index_prop.unsqueeze(1).expand(-1,weight.shape[1],-1)) # B, N-1-num_prop, num_prop
+            weight = weight.gather(dim=2, index=index_kept.unsqueeze(1).expand(-1,weight.shape[1],-1)) # B, N-1-num_prop, N-1-num_prop
+        else:
+            weight = weight.gather(dim=1, index=index_kept.unsqueeze(-1).expand(-1,-1,N)) # B, N-1-num_prop, N-1
+            weight_prop = weight.gather(dim=2, index=index_prop.unsqueeze(1).expand(-1,weight.shape[1],-1)) # B, N-1-num_prop, num_prop
+            weight = weight.gather(dim=2, index=index_kept.unsqueeze(1).expand(-1,weight.shape[1],-1)) # B, N-1-num_prop, N-1-num_prop
         
         # Step 3.2: generate the broadcast message and propagate the message to corresponding kept tokens
         # Simple implementation
@@ -118,23 +126,29 @@ def propagate(x: torch.Tensor, weight: torch.Tensor,
         
         # Step 3.3: calculate the scale of each token if token_scales is not None
         if token_scales is not None:
-            token_scales_cls = token_scales[:, 0:1] # B, 1
-            token_scales = token_scales[:, 1:]
+            if cls_token:
+                token_scales_cls = token_scales[:, 0:1] # B, 1
+                token_scales = token_scales[:, 1:]
             token_scales_kept = token_scales.gather(dim=1, index=index_kept) # B, N-1-num_prop
             token_scales_prop = token_scales.gather(dim=1, index=index_prop) # B, num_prop
             token_scales_prop = weight_prop @ token_scales_prop.unsqueeze(-1) # B, N-1-num_prop, 1
             token_scales = token_scales_kept + alpha * token_scales_prop.squeeze(-1) # B, N-1-num_prop
-            token_scales = torch.cat((token_scales_cls, token_scales), dim=1) # B, N-num_prop
+            if cls_token:
+                token_scales = torch.cat((token_scales_cls, token_scales), dim=1) # B, N-num_prop
     else:
         assert False, "Propagation method \'%f\' has not been supported yet." % standard
     
-    # Step 4： concatenate the [CLS] token and generate returned value
-    x = torch.cat((x_cls, x_kept), dim=1) # B, N-num_prop, C
+    
+    if cls_token:
+        # Step 4： concatenate the [CLS] token and generate returned value
+        x = torch.cat((x_cls, x_kept), dim=1) # B, N-num_prop, C
+    else:
+        x = x_kept
     return x, weight, token_scales
 
 
 
-def select(weight: torch.Tensor, standard: str = "None", num_prop: int = 0):
+def select(weight: torch.Tensor, standard: str = "None", num_prop: int = 0, cls_token = True):
     """
     Select image tokens to be propagated. The [CLS] token will be ignored. 
     ======================================================================
@@ -157,55 +171,110 @@ def select(weight: torch.Tensor, standard: str = "None", num_prop: int = 0):
     assert N1 == N2, "Selection methods on tensors other than the attention map haven't been supported yet."
     N = N1
     assert num_prop >= 0, "The number of propagated/pruned tokens must be non-negative."
-            
-    if standard == "CLSAttnMean":
-        token_rank = weight[:,:,0,1:].mean(1)
-        
-    elif standard == "CLSAttnMax":
-        token_rank = weight[:,:,0,1:].max(1)[0]
-            
-    elif standard == "IMGAttnMean":
-        token_rank = weight[:,:,:,1:].sum(-2).mean(1)
     
-    elif standard == "IMGAttnMax":
-        token_rank = weight[:,:,:,1:].sum(-2).max(1)[0]
+    if cls_token:
+        if standard == "CLSAttnMean":
+            token_rank = weight[:,:,0,1:].mean(1)
             
-    elif standard == "DiagAttnMean":
-        token_rank = torch.diagonal(weight, dim1=-2, dim2=-1)[:,:,1:].mean(1)
+        elif standard == "CLSAttnMax":
+            token_rank = weight[:,:,0,1:].max(1)[0]
+                
+        elif standard == "IMGAttnMean":
+            token_rank = weight[:,:,:,1:].sum(-2).mean(1)
         
-    elif standard == "DiagAttnMax":
-        token_rank = torch.diagonal(weight, dim1=-2, dim2=-1)[:,:,1:].max(1)[0]
+        elif standard == "IMGAttnMax":
+            token_rank = weight[:,:,:,1:].sum(-2).max(1)[0]
+                
+        elif standard == "DiagAttnMean":
+            token_rank = torch.diagonal(weight, dim1=-2, dim2=-1)[:,:,1:].mean(1)
+            
+        elif standard == "DiagAttnMax":
+            token_rank = torch.diagonal(weight, dim1=-2, dim2=-1)[:,:,1:].max(1)[0]
+            
+        elif standard == "MixedAttnMean":
+            token_rank_1 = torch.diagonal(weight, dim1=-2, dim2=-1)[:,:,1:].mean(1)
+            token_rank_2 = weight[:,:,:,1:].sum(-2).mean(1)
+            token_rank = token_rank_1 * token_rank_2
+            
+        elif standard == "MixedAttnMax":
+            token_rank_1 = torch.diagonal(weight, dim1=-2, dim2=-1)[:,:,1:].max(1)[0]
+            token_rank_2 = weight[:,:,:,1:].sum(-2).max(1)[0]
+            token_rank = token_rank_1 * token_rank_2
+            
+        elif standard == "SumAttnMax":
+            token_rank_1 = torch.diagonal(weight, dim1=-2, dim2=-1)[:,:,1:].max(1)[0]
+            token_rank_2 = weight[:,:,:,1:].sum(-2).max(1)[0]
+            token_rank = token_rank_1 + token_rank_2
+            
+        elif standard == "CosSimMean":
+            weight = weight[:,:,1:,:].mean(1)
+            weight = weight / weight.norm(dim=-1, keepdim=True)
+            token_rank = -(weight @ weight.transpose(-1, -2)).sum(-1)
         
-    elif standard == "MixedAttnMean":
-        token_rank_1 = torch.diagonal(weight, dim1=-2, dim2=-1)[:,:,1:].mean(1)
-        token_rank_2 = weight[:,:,:,1:].sum(-2).mean(1)
-        token_rank = token_rank_1 * token_rank_2
+        elif standard == "CosSimMax":
+            weight = weight[:,:,1:,:].max(1)[0]
+            weight = weight / weight.norm(dim=-1, keepdim=True)
+            token_rank = -(weight @ weight.transpose(-1, -2)).sum(-1)
+            
+        elif standard == "Random":
+            token_rank = torch.randn((B, N-1), device=weight.device)
+                
+        else:
+            print("Type\'", standard, "\' selection not supported.")
+            assert False
         
-    elif standard == "MixedAttnMax":
-        token_rank_1 = torch.diagonal(weight, dim1=-2, dim2=-1)[:,:,1:].max(1)[0]
-        token_rank_2 = weight[:,:,:,1:].sum(-2).max(1)[0]
-        token_rank = token_rank_1 * token_rank_2
-        
-    elif standard == "CosSimMean":
-        weight = weight[:,:,1:,:].mean(1)
-        weight = weight / weight.norm(dim=-1, keepdim=True)
-        token_rank = -(weight @ weight.transpose(-1, -2)).sum(-1)
-    
-    elif standard == "CosSimMax":
-        weight = weight[:,:,1:,:].max(1)[0]
-        weight = weight / weight.norm(dim=-1, keepdim=True)
-        token_rank = -(weight @ weight.transpose(-1, -2)).sum(-1)
-        
-    elif standard == "Random":
-        token_rank = torch.randn((B, N-1), device=weight.device)
+        token_rank = torch.argsort(token_rank, dim=1, descending=True) # B, N-1
+        index_kept = token_rank[:, :-num_prop]+1 # B, N-1-num_prop
+        index_prop = token_rank[:, -num_prop:]+1 # B, num_prop
             
     else:
-        print("Type\'", standard, "\' selection not supported.")
-        assert False
+        if standard == "IMGAttnMean":
+            token_rank = weight.sum(-2).mean(1)
         
-    token_rank = torch.argsort(token_rank, dim=1, descending=True) # B, N-1
-    index_kept = token_rank[:, :-num_prop]+1 # B, N-1-num_prop
-    index_prop = token_rank[:, -num_prop:]+1 # B, num_prop
+        elif standard == "IMGAttnMax":
+            token_rank = weight.sum(-2).max(1)[0]
+                
+        elif standard == "DiagAttnMean":
+            token_rank = torch.diagonal(weight, dim1=-2, dim2=-1).mean(1)
+            
+        elif standard == "DiagAttnMax":
+            token_rank = torch.diagonal(weight, dim1=-2, dim2=-1).max(1)[0]
+            
+        elif standard == "MixedAttnMean":
+            token_rank_1 = torch.diagonal(weight, dim1=-2, dim2=-1).mean(1)
+            token_rank_2 = weight.sum(-2).mean(1)
+            token_rank = token_rank_1 * token_rank_2
+            
+        elif standard == "MixedAttnMax":
+            token_rank_1 = torch.diagonal(weight, dim1=-2, dim2=-1).max(1)[0]
+            token_rank_2 = weight.sum(-2).max(1)[0]
+            token_rank = token_rank_1 * token_rank_2
+            
+        elif standard == "SumAttnMax":
+            token_rank_1 = torch.diagonal(weight, dim1=-2, dim2=-1).max(1)[0]
+            token_rank_2 = weight.sum(-2).max(1)[0]
+            token_rank = token_rank_1 + token_rank_2
+            
+        elif standard == "CosSimMean":
+            weight = weight.mean(1)
+            weight = weight / weight.norm(dim=-1, keepdim=True)
+            token_rank = -(weight @ weight.transpose(-1, -2)).sum(-1)
+        
+        elif standard == "CosSimMax":
+            weight = weight.max(1)[0]
+            weight = weight / weight.norm(dim=-1, keepdim=True)
+            token_rank = -(weight @ weight.transpose(-1, -2)).sum(-1)
+            
+        elif standard == "Random":
+            token_rank = torch.randn((B, N-1), device=weight.device)
+                
+        else:
+            print("Type\'", standard, "\' selection not supported.")
+            assert False
+        
+        token_rank = torch.argsort(token_rank, dim=1, descending=True) # B, N-1
+        index_kept = token_rank[:, :-num_prop] # B, N-1-num_prop
+        index_prop = token_rank[:, -num_prop:] # B, num_prop
     return index_kept, index_prop
             
             
@@ -228,6 +297,7 @@ class Attention(nn.Module):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
+        
         
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1))
@@ -287,14 +357,15 @@ class GraphPropagationBlock(nn.Module):
         self.sparsity = sparsity
         self.alpha = alpha
     
-    def forward(self, x, weight, token_scales=None):
+    def forward(self, x, weight, token_scales=None, cls_token=True):
         tmp, attn = self.attn(self.norm1(x), token_scales)
         x = x + self.drop_path(self.ls1(tmp))
         
         if self.selection != "None":
-            index_kept, index_prop = select(attn, standard=self.selection, num_prop=self.num_prop)
+            index_kept, index_prop = select(attn, standard=self.selection, num_prop=self.num_prop,
+                                            cls_token=cls_token)
             x, weight, token_scales = propagate(x, weight, index_kept, index_prop, standard=self.propagation,
-                                               alpha=self.alpha, token_scales=token_scales)
+                                               alpha=self.alpha, token_scales=token_scales, cls_token=cls_token)
                                                
         x = x + self.drop_path(self.ls2(self.mlp(self.norm2(x))))
         return x, weight, token_scales
@@ -364,6 +435,7 @@ class GraphPropagationTransformer(VisionTransformer):
         self.token_scale = token_scale
         self.num_neighbours = num_neighbours
         self.graph_type = graph_type
+        self.class_token = class_token
         
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule    
         self.blocks = nn.Sequential(*[
@@ -407,7 +479,10 @@ class GraphPropagationTransformer(VisionTransformer):
             self.spatial_graph = graph.to("cuda") # comment .to("cuda") if the environment is cpu
         
         if self.token_scale:
-            self.token_scales = torch.ones([N+1])
+            if self.class_token:
+                self.token_scales = torch.ones([N+1])
+            else:
+                self.token_scales = torch.ones([N])
     
     def forward_features(self, x):
         x = self.patch_embed(x)
@@ -418,11 +493,17 @@ class GraphPropagationTransformer(VisionTransformer):
         if self.graph_type in ["Semantic", "Mixed"]:
             # Generate the semantic graph w.r.t. the cosine similarity between tokens
             # Compute cosine similarity
-            x_normed = x[:, 1:] / x[:, 1:].norm(dim=-1, keepdim=True)
+            if self.class_token:
+                x_normed = x[:, 1:] / x[:, 1:].norm(dim=-1, keepdim=True)
+            else:
+                x_normed = x / x.norm(dim=-1, keepdim=True)
             x_cossim = x_normed @ x_normed.transpose(-1, -2)
             threshold = torch.kthvalue(x_cossim, N-1-self.num_neighbours, dim=-1, keepdim=True)[0] # B,H,1,1 
             semantic_graph = torch.where(x_cossim>=threshold, 1.0, 0.0)
-            semantic_graph = semantic_graph - torch.eye(N-1, device=semantic_graph.device).unsqueeze(0)
+            if self.class_token:
+                semantic_graph = semantic_graph - torch.eye(N-1, device=semantic_graph.device).unsqueeze(0)
+            else:
+                semantic_graph = semantic_graph - torch.eye(N, device=semantic_graph.device).unsqueeze(0)
         
         if self.graph_type == "None":
             graph = None
@@ -445,9 +526,9 @@ class GraphPropagationTransformer(VisionTransformer):
             token_scales = self.token_scales.unsqueeze(0).expand(B,-1).to(x.device)
         else:
             token_scales = None
-            
+        
         for blk in self.blocks:
-            x, graph, token_scales = blk(x, graph, token_scales)
+            x, graph, token_scales = blk(x, graph, token_scales, self.class_token)
         
         x = self.norm(x)
         return x
@@ -462,7 +543,91 @@ class GraphPropagationTransformer(VisionTransformer):
         x = self.forward_features(x)
         x = self.forward_head(x)
         return x
+
+
+class MultiCropWrapper(nn.Module):
+    """
+    Perform forward pass separately on each resolution input.
+    The inputs corresponding to a single resolution are clubbed and single
+    forward is run on the same resolution inputs. Hence we do several
+    forward passes = number of different resolutions used. We then
+    concatenate all the output features and run the head forward on these
+    concatenated features.
+    """
+    def __init__(self, backbone, head):
+        super(MultiCropWrapper, self).__init__()
+        # disable layers dedicated to ImageNet labels classification
+        backbone.fc, backbone.head = nn.Identity(), nn.Identity()
+        self.backbone = backbone
+        self.head = head
+
+    def forward(self, x):
+        # convert to list
+        if not isinstance(x, list):
+            x = [x]
+        idx_crops = torch.cumsum(torch.unique_consecutive(
+            torch.tensor([inp.shape[-1] for inp in x]),
+            return_counts=True,
+        )[1], 0)
+        start_idx, output = 0, torch.empty(0).to(x[0].device)
+        for end_idx in idx_crops:
+            _out = self.backbone(torch.cat(x[start_idx: end_idx]))
+            # The output is a tuple with XCiT model. See:
+            # https://github.com/facebookresearch/xcit/blob/master/xcit.py#L404-L405
+            if isinstance(_out, tuple):
+                _out = _out[0]
+            # accumulate outputs
+            output = torch.cat((output, _out))
+            start_idx = end_idx
+        # Run the head forward on the concatenated features.
+        return self.head(output)
         
+
+class DINOHead(nn.Module):
+    def __init__(self, in_dim, out_dim, use_bn=False, norm_last_layer=True, nlayers=3, hidden_dim=2048, bottleneck_dim=256):
+        super().__init__()
+        nlayers = max(nlayers, 1)
+        if nlayers == 1:
+            self.mlp = nn.Linear(in_dim, bottleneck_dim)
+        else:
+            layers = [nn.Linear(in_dim, hidden_dim)]
+            if use_bn:
+                layers.append(nn.BatchNorm1d(hidden_dim))
+            layers.append(nn.GELU())
+            for _ in range(nlayers - 2):
+                layers.append(nn.Linear(hidden_dim, hidden_dim))
+                if use_bn:
+                    layers.append(nn.BatchNorm1d(hidden_dim))
+                layers.append(nn.GELU())
+            layers.append(nn.Linear(hidden_dim, bottleneck_dim))
+            self.mlp = nn.Sequential(*layers)
+        self.apply(self._init_weights)
+        self.last_layer = nn.utils.weight_norm(nn.Linear(bottleneck_dim, out_dim, bias=False))
+        self.last_layer.weight_g.data.fill_(1)
+        if norm_last_layer:
+            self.last_layer.weight_g.requires_grad = False
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        x = self.mlp(x)
+        x = nn.functional.normalize(x, dim=-1, p=2)
+        x = self.last_layer(x)
+        return x
+        
+
+class LayerScale(nn.Module):
+    def __init__(self, dim, init_values=1e-5, inplace=False):
+        super().__init__()
+        self.inplace = inplace
+        self.gamma = nn.Parameter(init_values * torch.ones(dim))
+
+    def forward(self, x):
+        return x.mul_(self.gamma) if self.inplace else x * self.gamma
         
         
 @register_model
@@ -473,10 +638,154 @@ def graph_propagation_deit_small_patch16_224(pretrained=False, pretrained_cfg=No
     return model
     
     
-    
 @register_model
 def graph_propagation_deit_base_patch16_224(pretrained=False, pretrained_cfg=None, **kwargs):
     model = GraphPropagationTransformer(patch_size=16, embed_dim=768, depth=12,
                                         num_heads=12, mlp_ratio=4, qkv_bias=True,
                                         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
+
+
+@register_model
+def graph_propagation_vit_small_patch8_224_dino(pretrained=False, pretrained_cfg=None, **kwargs):
+    model = GraphPropagationTransformer(patch_size=8, embed_dim=384, depth=12,
+                                        num_heads=6, mlp_ratio=4, qkv_bias=True,
+                                        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+    
+    
+@register_model
+def graph_propagation_vit_small_patch16_224_augreg(pretrained=False, pretrained_cfg=None, **kwargs):
+    model = GraphPropagationTransformer(patch_size=16, embed_dim=384, depth=12,
+                                        num_heads=6, mlp_ratio=4, qkv_bias=True,
+                                        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+    
+    
+@register_model
+def graph_propagation_vit_base_patch8_224_augreg(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay=None, **kwargs):
+    model = GraphPropagationTransformer(patch_size=8, embed_dim=768, depth=12,
+                                        num_heads=12, mlp_ratio=4, qkv_bias=True,
+                                        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+    
+    
+@register_model
+def graph_propagation_vit_base_patch16_224_augreg(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay=None, **kwargs):
+    model = GraphPropagationTransformer(patch_size=16, embed_dim=768, depth=12,
+                                        num_heads=12, mlp_ratio=4, qkv_bias=True,
+                                        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+    
+    
+@register_model
+def graph_propagation_vit_base_patch16_224_clip(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay=None, **kwargs):
+    model = GraphPropagationTransformer(patch_size=16, embed_dim=768, depth=12,
+                                        num_heads=12, mlp_ratio=4, qkv_bias=True, pre_norm=True,
+                                        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+    
+
+@register_model
+def graph_propagation_vit_base_patch16_224_mae(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay=None, **kwargs):
+    model = GraphPropagationTransformer(patch_size=16, embed_dim=768, depth=12,
+                                        num_heads=12, mlp_ratio=4, qkv_bias=True, pre_norm=True,
+                                        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+    
+
+@register_model
+def graph_propagation_vit_base_patch16_224_dino(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay=None, **kwargs):
+    model = GraphPropagationTransformer(patch_size=16, embed_dim=768, depth=12,
+                                        num_heads=12, mlp_ratio=4, qkv_bias=True, 
+                                        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    model = MultiCropWrapper(model, DINOHead(768, 1000))
+    return model
+
+
+@register_model
+def graph_propagation_vit_medium_patch16_gap_256(pretrained=False, pretrained_cfg=None, **kwargs):
+    model = GraphPropagationTransformer(patch_size=16, embed_dim=512, depth=12,
+                                        num_heads=8, class_token=False, mlp_ratio=4, qkv_bias=False, 
+                                        global_pool='avg', init_values=1e-6, fc_norm=False, **kwargs)
+    return model
+    
+
+@register_model
+def graph_propagation_vit_medium_patch16_gap_384(pretrained=False, pretrained_cfg=None, **kwargs):
+    model = GraphPropagationTransformer(patch_size=16, embed_dim=512, depth=12,
+                                        num_heads=8, class_token=False, mlp_ratio=4, qkv_bias=False, 
+                                        global_pool='avg', init_values=1e-6, fc_norm=False, **kwargs)
+    return model
+    
+    
+@register_model
+def graph_propagation_vit_large_patch16_224_augreg(pretrained=False, pretrained_cfg=None, **kwargs):
+    model = GraphPropagationTransformer(patch_size=16, embed_dim=1024, depth=24,
+                                        num_heads=16, mlp_ratio=4, qkv_bias=True,
+                                        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+    
+    
+@register_model
+def graph_propagation_vit_large_patch16_384_augreg(pretrained=False, pretrained_cfg=None, **kwargs):
+    model = GraphPropagationTransformer(patch_size=16, embed_dim=1024, depth=24,
+                                        num_heads=16, mlp_ratio=4, qkv_bias=True,
+                                        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+
+
+@register_model
+def graph_propagation_eva_large_patch14_196(pretrained=False, pretrained_cfg=None, **kwargs):
+    model = GraphPropagationTransformer(patch_size=14, embed_dim=1024, depth=24,
+                                        num_heads=16, mlp_ratio=4, global_pool='avg',
+                                        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+    
+    
+@register_model
+def graph_propagation_eva_large_patch14_336(pretrained=False, pretrained_cfg=None, **kwargs):
+    model = GraphPropagationTransformer(patch_size=14, embed_dim=1024, depth=24,
+                                        num_heads=16, mlp_ratio=4, global_pool='avg',
+                                        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+
+
+@register_model
+def tome_vit_base_patch16_224_augreg(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay=None, **kwargs):
+    model = VisionTransformer(patch_size=16, embed_dim=768, depth=12,
+                              num_heads=12, mlp_ratio=4, qkv_bias=True,
+                              norm_layer=partial(nn.LayerNorm, eps=1e-6))#, **kwargs)
+    tome.patch.timm(model)
+    model.r = kwargs["num_prop"]
+    return model
+    
+
+@register_model
+def tome_vit_large_patch16_224_augreg(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay=None, **kwargs):
+    model = VisionTransformer(patch_size=16, embed_dim=1024, depth=24,
+                              num_heads=16, mlp_ratio=4, qkv_bias=True,
+                              norm_layer=partial(nn.LayerNorm, eps=1e-6))#, **kwargs)
+    tome.patch.timm(model)
+    model.r = kwargs["num_prop"]
+    return model
+    
+    
+@register_model
+def tome_vit_base_patch8_224_augreg(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay=None, **kwargs):
+    model = VisionTransformer(patch_size=8, embed_dim=768, depth=12,
+                              num_heads=12, mlp_ratio=4, qkv_bias=True,
+                              norm_layer=partial(nn.LayerNorm, eps=1e-6))#, **kwargs)
+    tome.patch.timm(model)
+    model.r = kwargs["num_prop"]
+    return model
+
+"""
+1. 不同backbone: LV-VIT-S, LV-VIT-M
+2. 不同size: ViT-S, ViT-B, ViT-L
+3. 不同训练方式: ViT-B-AugReg, ViT-B-CLIP, ViT-B-DINO, ViT-B-MAE
+4. 不同token数量: ViT-S-Patch8, ViT-B-Patch8
+5. 没有CLS token的： RPN, GAP, EVA
+
+
+"""

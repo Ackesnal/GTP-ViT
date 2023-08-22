@@ -6,7 +6,8 @@ import json
 from torchvision import datasets, transforms
 from torchvision.datasets.folder import ImageFolder, default_loader
 
-from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD, \
+    OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
 from timm.data import create_transform
 
 
@@ -103,7 +104,12 @@ def build_transform(is_train, args):
             transforms.Resize(size, interpolation=3),  # to maintain same ratio w.r.t. 224 images
         )
         t.append(transforms.CenterCrop(args.input_size))
-
+    
     t.append(transforms.ToTensor())
-    t.append(transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD))
+    if "deit" in args.model or "dino" in args.model:
+        t.append(transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD))
+    elif "clip" in args.model or "eva" in args.model:
+        t.append(transforms.Normalize(OPENAI_CLIP_MEAN, OPENAI_CLIP_STD))
+    elif "augreg" in args.model:
+        t.append(transforms.Normalize(IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD))
     return transforms.Compose(t)
