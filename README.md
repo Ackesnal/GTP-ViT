@@ -8,11 +8,11 @@ Code: \[[GitHub](https://github.com/Ackesnal/GTP-ViT/)\]
 ## GTP-ViT Architecture Overview
 ![Architecture Overview](img/Main_architecture.png)
 
-# Usage
+## Usage
 
-## Preparation
+### Preparation
 
-### Environment installation
+#### Environment installation
 
 Install Python 3.8+, PyTorch and timm:
 
@@ -24,7 +24,7 @@ pip install timm==0.9.2
 pip install torchprofile
 ```
 
-### Data preparation
+#### Data preparation
 
 Download and extract ImageNet train and val images from http://image-net.org/.
 The directory structure is the standard layout for the torchvision [`datasets.ImageFolder`](https://pytorch.org/docs/stable/torchvision/datasets.html#imagefolder), and the training and validation data is expected to be in the `train/` folder and `val` folder respectively:
@@ -43,7 +43,7 @@ The directory structure is the standard layout for the torchvision [`datasets.Im
       img4.jpeg
 ```
 
-### Pretrained model weights
+#### Pretrained model weights
 
 Please download DeiT (and other backbones) pretrained models from their official repository or HuggingFace.
 
@@ -51,7 +51,7 @@ This method works as a pluggable component to existing ViT backbones. For exampl
 
 You can refer to the end of [models_v3.py](models_v3.py) to find all the backbones we support at the moment and download their model weights by yourself. These weights are usually available on HuggingFace.
 
-## Evaluation
+### Evaluation
 
 To evaluate GTP without training, run:
 
@@ -62,3 +62,15 @@ python -m torch.distributed.launch --nproc_per_node=1 --master_port=12345 --use_
 You can adjust the arguments to explore difference results. Available values for these arguments can be found in main.py.
 
 [TO BE FURTHER CONSTRUCTED]
+
+## Reference
+If our code or models help your work, please cite EfficientFormer (NeurIPs 2022) and EfficientFormerV2 (ICCV 2023):
+```BibTeX
+@inproceedings{xu2024gtp,
+  title={GTP-ViT: Efficient Vision Transformers via Graph-based Token Propagation},
+  author={Xu, Xuwei and Wang, Sen and Chen, Yudong and Zheng, Yanping and Wei, Zhewei and Liu, Jiajun},
+  booktitle={Proceedings of the IEEE/CVF Winter Conference on Applications of Computer Vision (WACV)},
+  pages={86--95},
+  year={2024}
+}
+```
