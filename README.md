@@ -64,7 +64,7 @@ You can adjust the arguments to explore difference results. Available values for
 [TO BE FURTHER CONSTRUCTED]
 
 ## Reference
-If our code or models help your work, please cite EfficientFormer (NeurIPs 2022) and EfficientFormerV2 (ICCV 2023):
+If our code or models help your work, please cite GTP-ViT:
 ```BibTeX
 @inproceedings{xu2024gtp,
   title={GTP-ViT: Efficient Vision Transformers via Graph-based Token Propagation},
