@@ -533,7 +533,7 @@ class GraphPropagationTransformer(VisionTransformer):
                 x, graph, token_scales = cp.checkpoint(blk, x, graph, token_scales, self.class_token)
             else:
                 x, graph, token_scales = blk(x, graph, token_scales, self.class_token)
-        
+                 
         x = self.norm(x)
         return x
 
@@ -763,7 +763,6 @@ def tome_vit_base_patch16_224_augreg(pretrained=False, pretrained_cfg=None, pret
     tome.patch.timm(model)
     model.r = kwargs["num_prop"]
     return model
-    
 
 @register_model
 def tome_vit_large_patch16_224_augreg(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay=None, **kwargs):
@@ -784,6 +783,34 @@ def tome_vit_base_patch8_224_augreg(pretrained=False, pretrained_cfg=None, pretr
     model.r = kwargs["num_prop"]
     return model
 
+@register_model
+def tome_deit_base_patch16_224(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay=None, **kwargs):
+    model = VisionTransformer(patch_size=16, embed_dim=768, depth=12,
+                              num_heads=12, mlp_ratio=4, qkv_bias=True,
+                              norm_layer=partial(nn.LayerNorm, eps=1e-6))#, **kwargs)
+    tome.patch.timm(model)
+    model.r = kwargs["num_prop"]
+    return model
+    
+@register_model
+def tome_deit_small_patch16_224(pretrained=False, pretrained_cfg=None, pretrained_cfg_overlay=None, **kwargs):
+    model = VisionTransformer(patch_size=16, embed_dim=384, depth=12,
+                              num_heads=6, mlp_ratio=4, qkv_bias=True,
+                              norm_layer=partial(nn.LayerNorm, eps=1e-6))#, **kwargs)
+    tome.patch.timm(model)
+    model.r = kwargs["num_prop"]
+    return model
+
+@register_model
+def tome_eva_large_patch14_196(pretrained=False, pretrained_cfg=None, **kwargs):
+    model = VisionTransformer(patch_size=14, embed_dim=1024, depth=24,
+                              num_heads=16, mlp_ratio=4, global_pool='avg',
+                              norm_layer=partial(nn.LayerNorm, eps=1e-6),
+                              img_size=196)#, **kwargs)
+    tome.patch.timm(model)
+    model.r = kwargs["num_prop"]
+    return model
+    
 """
 1. 不同backbone: LV-VIT-S, LV-VIT-M
 2. 不同size: ViT-S, ViT-B, ViT-L

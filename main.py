@@ -43,18 +43,17 @@ def get_macs(model, x=None, img_size=224):
     return macs
 
 
-def speed_test(model, ntest=100, batchsize=32, x=None, **kwargs):
+def speed_test(model, ntest=100, batchsize=128, img_size=224, x=None, **kwargs):
     if x is None:
-        x = torch.rand(batchsize, 3, 224, 224).cuda()
+        x = torch.rand(batchsize, 3, img_size, img_size).cuda()
     else:
         batchsize = x.shape[0]
     model.eval()
 
     start = time.time()
-    with torch.cuda.amp.autocast():
-        with torch.no_grad():
-            for i in range(ntest):
-                model(x, **kwargs)
+    with torch.no_grad():
+        for i in range(ntest):
+            model(x, **kwargs)
     end = time.time()
 
     elapse = end - start
@@ -493,13 +492,13 @@ def main(args):
     if args.test_speed:
         # test model throughput for three times to ensure accuracy
         print('Start inference speed testing...')
-        inference_speed = speed_test(model)
+        inference_speed = speed_test(model, img_size=args.input_size)
         print('inference_speed (inaccurate):', inference_speed, 'images/s')
         total = 0
-        inference_speed = speed_test(model)
+        inference_speed = speed_test(model, img_size=args.input_size)
         print('inference_speed:', inference_speed, 'images/s')
         total = total + inference_speed
-        inference_speed = speed_test(model)
+        inference_speed = speed_test(model, img_size=args.input_size)
         print('inference_speed:', inference_speed, 'images/s')
         total = total + inference_speed
         #inference_speed = speed_test(model)
@@ -518,7 +517,7 @@ def main(args):
         test_stats = evaluate(data_loader_val, model, device)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         
-        """
+        
         ####### delete
         with open(args.model+"_results", "a") as fp:
             fp.write("|  Num Prop: %2d  " % args.num_prop)
@@ -531,7 +530,7 @@ def main(args):
             fp.write("|  Scale: %5s  " % str(args.token_scale))
             fp.write("|  Graph: %8s  |\n\n" % str(args.graph_type))
         ####### delete
-        """
+        
         
         return
     
