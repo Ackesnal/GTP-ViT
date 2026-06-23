@@ -41,7 +41,7 @@ The directory structure is the standard layout for the torchvision [`datasets.Im
 
 Please download ViT pre-trained models and place them in the `weights/` folder. This repository currently supports .pth and .safetensors weight types. You can find the pre-trained model weights from their original repositories or Hugging Face. Below are some links to the pre-trained models used in our paper:
 
-| name | url |
+| Base model | URL |
 | --- | --- |
 | DeiT-Ti-Patch16-224 | [Model download](https://dl.fbaipublicfiles.com/deit/deit_tiny_patch16_224-a1311bcf.pth) |
 | DeiT-S-Patch16-224 | [Model download](https://dl.fbaipublicfiles.com/deit/deit_small_patch16_224-cd65a155.pth) |
