@@ -519,7 +519,7 @@ def main(args):
         
         
         ####### delete
-        with open(args.model+"_results", "a") as fp:
+        with open(f"outputs/{args.model}_results", "a") as fp:
             fp.write("|  Num Prop: %2d  " % args.num_prop)
             fp.write("|  GMACs: %1.3f  " % (MACs*1e-9))
             fp.write("|  Top-1 Acc: %2.2f  " % test_stats['acc1'])

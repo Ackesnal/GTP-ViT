@@ -11,8 +11,6 @@ import math
 from typing import Optional
 import timm
 import torch.utils.checkpoint as cp
-import tome
-
 
 def propagate(x: torch.Tensor, weight: torch.Tensor, 
               index_kept: torch.Tensor, index_prop: torch.Tensor, 
@@ -102,8 +100,12 @@ def propagate(x: torch.Tensor, weight: torch.Tensor,
             weight_prop = weight.gather(dim=2, index=index_prop.unsqueeze(1).expand(-1,weight.shape[1],-1)) # B, N-1-num_prop, num_prop
             weight = weight.gather(dim=2, index=index_kept.unsqueeze(1).expand(-1,weight.shape[1],-1)) # B, N-1-num_prop, N-1-num_prop
         
+        with open("missing", "a") as fp:
+            fp.write(str((weight_prop.sum(1)==0).to(torch.float).mean(1).mean().item())+"\n")
+            
         # Step 3.2: generate the broadcast message and propagate the message to corresponding kept tokens
         # Simple implementation
+        #print((weight_prop.sum(1)==0).any())
         x_prop = weight_prop @ x_prop # B, N-1-num_prop, C
         x_kept = x_kept + alpha * x_prop # B, N-1-num_prop, C
         
@@ -149,7 +151,7 @@ def propagate(x: torch.Tensor, weight: torch.Tensor,
 
 
 
-def select(weight: torch.Tensor, standard: str = "None", num_prop: int = 0, cls_token = True):
+def select(weight: torch.Tensor, standard: str = "None", num_prop: int = 0, cls_token = True, W=None):
     """
     Select image tokens to be propagated. The [CLS] token will be ignored. 
     ======================================================================
@@ -274,11 +276,14 @@ def select(weight: torch.Tensor, standard: str = "None", num_prop: int = 0, cls_
             assert False
         
         token_rank = torch.argsort(token_rank, dim=1, descending=True) # B, N-1
+        
         index_kept = token_rank[:, :-num_prop] # B, N-1-num_prop
         index_prop = token_rank[:, -num_prop:] # B, num_prop
+        
     return index_kept, index_prop
-            
-            
+
+    
+                
 
 class Attention(nn.Module):
     # taken from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
@@ -364,7 +369,7 @@ class GraphPropagationBlock(nn.Module):
         
         if self.selection != "None":
             index_kept, index_prop = select(attn, standard=self.selection, num_prop=self.num_prop,
-                                            cls_token=cls_token)
+                                            cls_token=cls_token, W=weight)
             x, weight, token_scales = propagate(x, weight, index_kept, index_prop, standard=self.propagation,
                                                alpha=self.alpha, token_scales=token_scales, cls_token=cls_token)
                                                
@@ -439,6 +444,8 @@ class GraphPropagationTransformer(VisionTransformer):
         self.class_token = class_token
         
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule    
+        
+        #num_prop = [8,8,8,12,12,12,16,16,16,16,16,16] # [4,4,4,8,8,8,12,12,12,16,16,16] # [6,6,8,8,8,8,8,10,10,10,10,10]
         self.blocks = nn.Sequential(*[
             block_fn(
                 dim=embed_dim,
@@ -453,7 +460,7 @@ class GraphPropagationTransformer(VisionTransformer):
                 act_layer=act_layer,
                 selection=selection,
                 propagation=propagation,
-                num_prop=num_prop,
+                num_prop=num_prop if type(num_prop) == int else num_prop[i],
                 sparsity=sparsity,
                 alpha=alpha
             )
